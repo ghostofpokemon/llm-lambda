@@ -8,7 +8,7 @@ import json
 def get_lambda_models(key):
     headers = {"Authorization": f"Bearer {key}"}
     return fetch_cached_json(
-        url="https://api.lambdalabs.com/v1/models",
+        url="https://api.lambda.ai/v1/models",
         path=llm.user_dir() / "lambda_models.json",
         cache_timeout=3600,
         headers=headers,
@@ -35,7 +35,7 @@ class LambdaChat(Chat):
     def __str__(self):
         return f"Lambda Chat: {self.model_id}"
 
-    def execute(self, prompt, stream, response, conversation=None):
+    def execute(self, prompt, stream, response, conversation=None, **_extra):
         messages = []
         if conversation is not None:
             for prev_response in conversation.responses:
@@ -48,8 +48,8 @@ class LambdaChat(Chat):
 
         messages.append({"role": "user", "content": prompt.prompt})
         response._prompt_json = {"messages": messages}
-        kwargs = self.build_kwargs(prompt)
-        client = self.get_client()
+        kwargs = self.build_kwargs(prompt, stream)
+        client = self.get_client(self.key)
 
         retries = 3
         delay = 5  # seconds
@@ -64,9 +64,12 @@ class LambdaChat(Chat):
                 )
 
                 for chunk in completion:
-                    content = chunk.choices[0].delta.content
-                    if content is not None:
-                        yield content
+                    # Some chunks may be keep-alives with no choices
+                    if not chunk.choices:
+                        continue
+                    delta = getattr(chunk.choices[0], "delta", None)
+                    if delta and delta.content is not None:
+                        yield delta.content
 
                 response.response_json = {"content": "".join(response._chunks)}
                 break  # Exit the retry loop if successful
@@ -87,7 +90,7 @@ class LambdaCompletion(Completion):
     def __str__(self):
         return f"Lambda Completion: {self.model_id}"
 
-    def execute(self, prompt, stream, response, conversation=None):
+    def execute(self, prompt, stream, response, conversation=None, **_extra):
         messages = []
         if conversation is not None:
             for prev_response in conversation.responses:
@@ -101,8 +104,8 @@ class LambdaCompletion(Completion):
 
         full_prompt = "\n".join(messages)
         response._prompt_json = {"messages": messages}
-        kwargs = self.build_kwargs(prompt)
-        client = self.get_client()
+        kwargs = self.build_kwargs(prompt, stream)
+        client = self.get_client(self.key)
 
         retries = 3
         delay = 5  # seconds
@@ -117,8 +120,11 @@ class LambdaCompletion(Completion):
                         **kwargs,
                     )
                     for chunk in completion:
-                        if chunk.choices and chunk.choices[0].text is not None:
-                            yield chunk.choices[0].text
+                        if not chunk.choices:
+                            continue
+                        text = chunk.choices[0].text
+                        if text is not None:
+                            yield text
                     response.response_json = self.combine_chunks(completion)
                 else:
                     completion = client.completions.create(
@@ -156,25 +162,28 @@ def register_models(register):
     try:
         models = get_lambda_models(key)
         models_with_aliases = get_model_ids_with_aliases(models)
+        # Register all chat models first, so they appear grouped at the top
         for model_id, aliases in models_with_aliases:
             chat_aliases = [alias for alias in aliases if alias.endswith("-chat")]
-            completion_aliases = [alias for alias in aliases if alias.endswith("-completion")]
-
             register(
                 LambdaChat(
                     model_id=f"lambdachat/{model_id}",
                     model_name=model_id,
-                    api_base="https://api.lambdalabs.com/v1",
+                    api_base="https://api.lambda.ai/v1",
                 ),
-                aliases=chat_aliases
+                aliases=chat_aliases,
             )
+
+        # Then register completion models so they are listed after the chat models
+        for model_id, aliases in models_with_aliases:
+            completion_aliases = [alias for alias in aliases if alias.endswith("-completion")]
             register(
                 LambdaCompletion(
                     model_id=f"lambdacompletion/{model_id}",
                     model_name=model_id,
-                    api_base="https://api.lambdalabs.com/v1",
+                    api_base="https://api.lambda.ai/v1",
                 ),
-                aliases=completion_aliases
+                aliases=completion_aliases,
             )
     except DownloadError as e:
         print(f"Error fetching Lambda models: {e}")
